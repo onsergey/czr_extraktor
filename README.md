@@ -27,7 +27,7 @@
 
 ### Project Structure
 ```
-modreoko/czr/
+czr_extraktor/
 ├── czr_extraktor.cpp     - Main application source code
 ├── framework.h           - Windows framework includes
 ├── czr_extraktor.h       - Header file with resource definitions
@@ -63,7 +63,7 @@ modreoko/czr/
 
 ### Структура проекта
 ```
-modreoko/czr/
+czr_extraktor/
 ├── czr_extraktor.cpp     - Исходный код приложения
 ├── framework.h           - Включаемые файлы Windows
 ├── czr_extraktor.h       - Заголовочный файл с определениями ресурсов
@@ -82,7 +82,7 @@ modreoko/czr/
 Open Source
 
 ### Автор
-modreoko
+onsergey
 
 ---
 
