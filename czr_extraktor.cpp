@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <windows.h>
 
 #define MAX_LOADSTRING 100
@@ -16,8 +17,9 @@ HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
 WCHAR szWindowClass[MAX_LOADSTRING];
 
-// Обработчик выбора файла
+// Обработчик выбора файлов
 HWND hFilePathEdit = nullptr;
+std::vector<std::wstring> g_selectedFiles;
 
 // Объявления функций:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -40,33 +42,36 @@ std::wstring StringToWide(const std::string& str) {
     return wstr;
 }
 
-// Извлечение PNG из файла
+// Чтение всего файла в память
+bool ReadWholeFile(const WCHAR* filePath, std::string& content) {
+    std::ifstream inputFile(filePath, std::ios::binary);
+    if (!inputFile.is_open())
+        return false;
+    std::stringstream buffer;
+    buffer << inputFile.rdbuf();
+    content = buffer.str();
+    return true;
+}
+
+// Извлечение PNG из файла (как раньше — от первого маркера до конца файла)
 bool ExtractPNG(const WCHAR* inputFilePath, const WCHAR* outputFilePath) {
     try {
-        // Открытие входного файла в бинарном режиме
-        std::ifstream inputFile(inputFilePath, std::ios::binary);
-        if (!inputFile.is_open()) {
+        std::string fileContent;
+        if (!ReadWholeFile(inputFilePath, fileContent)) {
             MessageBox(nullptr, L"Не удалось открыть входной файл!", L"Ошибка", MB_ICONERROR);
             return false;
         }
 
-        // Чтение всего файла
-        std::stringstream buffer;
-        buffer << inputFile.rdbuf();
-        std::string fileContent = buffer.str();
-        inputFile.close();
-
-        // Поиск маркеров PNG
-        size_t pngPos = std::string::npos;
-
         // Поиск маркера PNG (‰PNG)
         const unsigned char pngMagic[] = { 0x89, 0x50, 0x4E, 0x47 };
+        size_t pngPos = std::string::npos;
 
-        // Преобразуем в поиск по сырым байтам
-        for (size_t i = 0; i < fileContent.size() - 3; ++i) {
-            if (memcmp(&fileContent[i], pngMagic, 4) == 0) {
-                pngPos = i;
-                break;
+        if (fileContent.size() >= 4) {
+            for (size_t i = 0; i + 4 <= fileContent.size(); ++i) {
+                if (memcmp(&fileContent[i], pngMagic, 4) == 0) {
+                    pngPos = i;
+                    break;
+                }
             }
         }
 
@@ -75,7 +80,6 @@ bool ExtractPNG(const WCHAR* inputFilePath, const WCHAR* outputFilePath) {
             return false;
         }
 
-        // Извлечение PNG данных (от маркера до конца файла)
         std::ofstream outputFile(outputFilePath, std::ios::binary);
         if (!outputFile.is_open()) {
             MessageBox(nullptr, L"Не удалось создать выходной файл!", L"Ошибка", MB_ICONERROR);
@@ -85,12 +89,10 @@ bool ExtractPNG(const WCHAR* inputFilePath, const WCHAR* outputFilePath) {
         outputFile.write(&fileContent[pngPos], fileContent.size() - pngPos);
         outputFile.close();
 
-        // Сообщение об успехе
         std::wstring message = L"PNG успешно извлечено!\nФайл сохранен: ";
         message += outputFilePath;
         MessageBox(nullptr, message.c_str(), L"Успех", MB_ICONINFORMATION);
         return true;
-
     }
     catch (const std::exception& e) {
         std::string errorMsg = std::string("Ошибка при обработке файла: ") + e.what();
@@ -99,19 +101,162 @@ bool ExtractPNG(const WCHAR* inputFilePath, const WCHAR* outputFilePath) {
     }
 }
 
-// Диалог выбора файла
-bool OpenFileDialog(HWND hWnd, WCHAR* filePath, DWORD bufferSize) {
+// Извлечение всех JPEG из файла (XML+JPG содержимое)
+// Возвращает количество извлечённых изображений (-1 при ошибке открытия)
+int ExtractJpegs(const WCHAR* inputFilePath) {
+    try {
+        std::string fileContent;
+        if (!ReadWholeFile(inputFilePath, fileContent)) {
+            MessageBox(nullptr, L"Не удалось открыть входной файл!", L"Ошибка", MB_ICONERROR);
+            return -1;
+        }
+
+        // Маркер начала JPEG (SOI + первый байт маркера): FF D8 FF
+        const unsigned char jpgStart[] = { 0xFF, 0xD8, 0xFF };
+        // Маркер конца JPEG (EOI): FF D9
+        const unsigned char jpgEnd[] = { 0xFF, 0xD9 };
+        const size_t startLen = 3;
+        const size_t endLen = 2;
+
+        // Собираем все позиции начала JPEG
+        std::vector<size_t> starts;
+        if (fileContent.size() >= startLen) {
+            for (size_t i = 0; i + startLen <= fileContent.size(); ++i) {
+                if (memcmp(&fileContent[i], jpgStart, startLen) == 0)
+                    starts.push_back(i);
+            }
+        }
+
+        if (starts.empty()) {
+            MessageBox(nullptr, L"JPG маркеры не найдены в файле!", L"Ошибка", MB_ICONWARNING);
+            return 0;
+        }
+
+        // Формируем базу имени выходных файлов (без расширения)
+        std::wstring inputPath(inputFilePath);
+        size_t slash = inputPath.find_last_of(L"\\/");
+        std::wstring dir = (slash == std::wstring::npos) ? L"" : inputPath.substr(0, slash + 1);
+        std::wstring name = (slash == std::wstring::npos) ? inputPath : inputPath.substr(slash + 1);
+        size_t dot = name.find_last_of(L'.');
+        std::wstring base = (dot == std::wstring::npos) ? name : name.substr(0, dot);
+
+        int extracted = 0;
+        for (size_t s = 0; s < starts.size(); ++s) {
+            // Ищем конец (FF D9) начиная со следующего байта после SOI
+            size_t endPos = std::string::npos;
+            for (size_t i = starts[s] + startLen; i + endLen <= fileContent.size(); ++i) {
+                if (memcmp(&fileContent[i], jpgEnd, endLen) == 0) {
+                    endPos = i;
+                    break;
+                }
+            }
+            if (endPos == std::string::npos) {
+                // Незавершённый JPEG — пропускаем
+                continue;
+            }
+
+            // Имя файла: исходное имя _001.jpg, _002.jpg, ...
+            WCHAR suffix[16];
+            swprintf_s(suffix, L"_%03d.jpg", (int)(extracted + 1));
+            std::wstring outPath = dir + base + suffix;
+
+            std::ofstream outputFile(outPath.c_str(), std::ios::binary);
+            if (!outputFile.is_open())
+                continue;
+
+            // Записываем JPEG целиком: от SOI включительно до EOI включительно
+            size_t length = (endPos + endLen) - starts[s];
+            outputFile.write(&fileContent[starts[s]], length);
+            outputFile.close();
+            ++extracted;
+        }
+
+        return extracted;
+    }
+    catch (const std::exception& e) {
+        std::string errorMsg = std::string("Ошибка при обработке файла: ") + e.what();
+        MessageBox(nullptr, StringToWide(errorMsg).c_str(), L"Ошибка", MB_ICONERROR);
+        return -1;
+    }
+}
+
+// Диалог выбора нескольких файлов.
+// Возвращает список полных путей; если выбран один файл — список из одного элемента.
+std::vector<std::wstring> OpenFileDialogMulti(HWND hWnd) {
+    std::vector<std::wstring> result;
+
+    // Буфер под многофайловый выбор: каталог + все имена файлов
+    static const DWORD bufferSize = 32768;
+    WCHAR* filePath = new WCHAR[bufferSize];
+    filePath[0] = L'\0';
+
     OPENFILENAMEW ofn;
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hWnd;
     ofn.lpstrFile = filePath;
     ofn.nMaxFile = bufferSize;
-    ofn.lpstrFilter = L"CZR файлы (*.czr)\0*.czr\0Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"CZI файлы (*.czi)\0*.czi\0CZR файлы (*.czr)\0*.czr\0Все файлы (*.*)\0*.*\0";
     ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST
+        | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
 
-    return GetOpenFileNameW(&ofn);
+    if (GetOpenFileNameW(&ofn)) {
+        WCHAR* p = filePath;
+
+        // Первый фрагмент: каталог (при мультивыборе) или полный путь (одиночный выбор)
+        std::wstring first(p);
+        p += first.size() + 1;
+
+        if (*p == L'\0') {
+            // Выбран один файл — первый фрагмент уже полный путь
+            result.push_back(first);
+        }
+        else {
+            // Мультивыбор: первый фрагмент — каталог, дальше — имена файлов
+            std::wstring dir = first;
+            if (!dir.empty() && dir.back() != L'\\')
+                dir += L'\\';
+            while (*p) {
+                std::wstring fileName(p);
+                result.push_back(dir + fileName);
+                p += fileName.size() + 1;
+            }
+        }
+    }
+
+    delete[] filePath;
+    return result;
+}
+
+// Обработка одного выбранного файла в зависимости от расширения
+bool ProcessFile(HWND hWnd, const std::wstring& filePath) {
+    // Определяем расширение
+    size_t dot = filePath.find_last_of(L'.');
+    std::wstring ext = (dot == std::wstring::npos) ? L"" : filePath.substr(dot);
+    // Приводим к нижнему регистру
+    for (auto& c : ext) c = (WCHAR)towlower(c);
+
+    if (ext == L".czr") {
+        // Старый режим: один PNG
+        std::wstring outputPath = filePath.substr(0, dot == std::wstring::npos ? filePath.size() : dot) + L".png";
+        return ExtractPNG(filePath.c_str(), outputPath.c_str());
+    }
+    else if (ext == L".czi") {
+        // Новый режим: извлечение всех JPEG
+        int count = ExtractJpegs(filePath.c_str());
+        if (count <= 0)
+            return false;
+        std::wstring message = L"Файл: " + filePath + L"\nИзвлечено изображений: " + std::to_wstring(count);
+        MessageBox(hWnd, message.c_str(), L"Успех", MB_ICONINFORMATION);
+        return true;
+    }
+    else {
+        MessageBox(hWnd,
+            (L"Неизвестный тип файла: " + filePath + L"\nПоддерживаются .czr (PNG) и .czi (JPG).").c_str(),
+            L"Предупреждение", MB_ICONWARNING);
+        return false;
+    }
 }
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -172,7 +317,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     hInst = hInstance;
 
     HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+        CW_USEDEFAULT, 0, 400, 200, nullptr, nullptr, hInstance, nullptr);
 
     if (!hWnd)
     {
@@ -180,13 +325,13 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     }
 
     // Создание элементов интерфейса
-    // Статический текст "Выберите файл:"
-    CreateWindowW(L"STATIC", L"Выберите файл:",
-        WS_VISIBLE | WS_CHILD, 10, 10, 100, 20, hWnd, nullptr, hInstance, nullptr);
+    // Статический текст "Выберите файлы:"
+    CreateWindowW(L"STATIC", L"Выберите файлы:",
+        WS_VISIBLE | WS_CHILD, 10, 10, 120, 20, hWnd, nullptr, hInstance, nullptr);
 
-    // Поле редактирования для пути к файлу
+    // Поле редактирования для отображения выбора
     hFilePathEdit = CreateWindowW(L"EDIT", L"",
-        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_READONLY, 10, 35, 250, 25,
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_READONLY | ES_AUTOHSCROLL, 10, 35, 250, 25,
         hWnd, (HMENU)IDC_FILEPATH_EDIT, hInstance, nullptr);
 
     // Кнопка "Обзор"
@@ -194,8 +339,8 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
         WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 270, 35, 80, 25,
         hWnd, (HMENU)IDC_BROWSE_BTN, hInstance, nullptr);
 
-    // Кнопка "Записать PNG"
-    CreateWindowW(L"BUTTON", L"Записать PNG",
+    // Кнопка "Извлечь изображения"
+    CreateWindowW(L"BUTTON", L"Извлечь изображения",
         WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 10, 75, 340, 30,
         hWnd, (HMENU)IDC_EXTRACT_BTN, hInstance, nullptr);
 
@@ -207,8 +352,6 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
-    static WCHAR szFilePath[MAX_PATH] = L"";
-
     switch (message)
     {
     case WM_COMMAND:
@@ -219,35 +362,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
         case IDC_BROWSE_BTN:
         {
-            if (OpenFileDialog(hWnd, szFilePath, MAX_PATH))
-            {
-                SetWindowTextW(hFilePathEdit, szFilePath);
+            g_selectedFiles = OpenFileDialogMulti(hWnd);
+            if (!g_selectedFiles.empty()) {
+                if (g_selectedFiles.size() == 1) {
+                    SetWindowTextW(hFilePathEdit, g_selectedFiles[0].c_str());
+                }
+                else {
+                    std::wstring info = L"Выбрано файлов: " + std::to_wstring(g_selectedFiles.size());
+                    SetWindowTextW(hFilePathEdit, info.c_str());
+                }
             }
         }
         break;
 
         case IDC_EXTRACT_BTN:
         {
-            if (wcslen(szFilePath) == 0)
+            if (g_selectedFiles.empty())
             {
-                MessageBox(hWnd, L"Пожалуйста, выберите файл!", L"Предупреждение", MB_ICONWARNING);
+                MessageBox(hWnd, L"Пожалуйста, выберите файлы!", L"Предупреждение", MB_ICONWARNING);
                 break;
             }
 
-            // Генерирование имени выходного файла
-            WCHAR outputPath[MAX_PATH];
-            wcscpy_s(outputPath, MAX_PATH, szFilePath);
-
-            // Замена расширения на .png
-            WCHAR* dot = wcsrchr(outputPath, L'.');
-            if (dot) {
-                wcscpy_s(dot, MAX_PATH - (dot - outputPath), L".png");
-            }
-            else {
-                wcscat_s(outputPath, MAX_PATH, L".png");
+            int ok = 0, failed = 0;
+            for (const auto& file : g_selectedFiles) {
+                if (ProcessFile(hWnd, file))
+                    ++ok;
+                else
+                    ++failed;
             }
 
-            ExtractPNG(szFilePath, outputPath);
+            if (g_selectedFiles.size() > 1) {
+                std::wstring summary = L"Обработано успешно: " + std::to_wstring(ok)
+                    + L"\nС ошибками: " + std::to_wstring(failed);
+                MessageBox(hWnd, summary.c_str(), L"Итог", MB_ICONINFORMATION);
+            }
         }
         break;
 
